@@ -479,6 +479,15 @@ it fallbacks to JUnit default behaviour which does not set a `ClassOrderer` at a
 The Quarkus orderer can also be disabled entirely by
 setting another `ClassOrderer` using the JUnit configuration. This is only permitted in cases where all Quarkus tests would run on the same application (that is, the use of test profiles and test resources is limited).
 
+If you need to bypass the class orderer validation check (for example, when using a custom test ordering strategy and you're certain your tests don't require profile-based grouping), you can disable it using the system property:
+
+[source,bash]
+----
+mvn test -Dquarkus.test.disable-orderer-check=true
+----
+
+WARNING: Disabling the orderer check when you have multiple test profiles may lead to test failures with "corrupted application" errors. Only use this option if you fully understand the implications.
+
 === Writing a Profile
 
 To implement a test profile we need to implement `io.quarkus.test.junit.QuarkusTestProfile`:

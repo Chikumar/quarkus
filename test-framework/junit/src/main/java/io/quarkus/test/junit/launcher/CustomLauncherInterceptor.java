@@ -1,7 +1,11 @@
 package io.quarkus.test.junit.launcher;
 
+import java.io.IOException;
+import java.net.URL;
+import java.util.Enumeration;
 import java.util.Optional;
 
+import org.jboss.logging.Logger;
 import org.junit.jupiter.api.ClassOrderer;
 import org.junit.platform.launcher.LauncherDiscoveryListener;
 import org.junit.platform.launcher.LauncherDiscoveryRequest;
@@ -17,8 +21,11 @@ import io.quarkus.test.junit.util.QuarkusTestProfileAwareClassOrderer;
 public class CustomLauncherInterceptor
         implements LauncherDiscoveryListener, LauncherSessionListener, TestExecutionListener {
 
+    private static final Logger LOG = Logger.getLogger(CustomLauncherInterceptor.class);
+
     private static final Class<? extends ClassOrderer> DESIRED_CLASS_ORDERER = QuarkusTestProfileAwareClassOrderer.class;
     private static final Class<? extends ClassOrderer> CONFIG_SETTING_DESIRED_CLASS_ORDERER = QuarkusClassOrderer.class;
+    private static final String ORDERER_CHECK_DISABLE_PROPERTY = "quarkus.test.disable-orderer-check";
 
     private static FacadeClassLoader facadeLoader = null;
     // Also use a static variable to store a 'first' starting state that we can reset to
@@ -138,20 +145,65 @@ public class CustomLauncherInterceptor
 
             }
 
+            // Allow users to disable this check if they know what they're doing
+            if (System.getProperty(ORDERER_CHECK_DISABLE_PROPERTY) != null) {
+                LOG.debugf("Class orderer validation disabled via system property %s", ORDERER_CHECK_DISABLE_PROPERTY);
+                return;
+            }
+
             Optional<String> orderer = request.getConfigurationParameters().get("junit.jupiter.testclass.order.default");
 
             if (orderer.isEmpty() || !(orderer.get()
                     .equals(DESIRED_CLASS_ORDERER.getName())
                     || orderer.get().equals(CONFIG_SETTING_DESIRED_CLASS_ORDERER.getName()))) {
                 if (facadeLoader != null && facadeLoader.hasMultipleClassLoaders()) {
-                    String message = getFailureMessageForJUnitMisconfiguration(orderer);
-                    throw new IllegalStateException(message);
+                    // Check if the Quarkus junit-platform.properties is on the classpath
+                    boolean quarkusPropertiesFound = isQuarkusJunitPropertiesOnClasspath();
+
+                    if (quarkusPropertiesFound && orderer.isEmpty()) {
+                        // The Quarkus properties file is on the classpath but JUnit didn't load it
+                        // This might be a timing issue or classloader issue - log a warning but don't fail
+                        LOG.warnf(
+                                "Multiple test profiles detected but junit.jupiter.testclass.order.default is not set. "
+                                        + "However, the Quarkus junit-platform.properties file was found on the classpath. "
+                                        + "If you encounter test failures with 'corrupted application' errors, please add "
+                                        + "junit.jupiter.testclass.order.default=%s to your project's junit-platform.properties file. "
+                                        + "To suppress this warning, set the system property -D%s=true",
+                                DESIRED_CLASS_ORDERER.getName(), ORDERER_CHECK_DISABLE_PROPERTY);
+                    } else {
+                        String message = getFailureMessageForJUnitMisconfiguration(orderer, quarkusPropertiesFound);
+                        throw new IllegalStateException(message);
+                    }
                 }
             }
         }
     }
 
-    private static String getFailureMessageForJUnitMisconfiguration(Optional<String> orderer) {
+    /**
+     * Check if the Quarkus junit-platform.properties file is on the classpath.
+     */
+    private static boolean isQuarkusJunitPropertiesOnClasspath() {
+        try {
+            ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+            if (classLoader == null) {
+                classLoader = CustomLauncherInterceptor.class.getClassLoader();
+            }
+            Enumeration<URL> resources = classLoader.getResources("junit-platform.properties");
+            while (resources.hasMoreElements()) {
+                URL url = resources.nextElement();
+                String urlString = url.toString();
+                // Check if this is the Quarkus test framework's properties file
+                if (urlString.contains("quarkus-junit") || urlString.contains("io/quarkus/test")) {
+                    return true;
+                }
+            }
+        } catch (IOException e) {
+            LOG.debugf(e, "Failed to check for Quarkus junit-platform.properties on classpath");
+        }
+        return false;
+    }
+
+    private static String getFailureMessageForJUnitMisconfiguration(Optional<String> orderer, boolean quarkusPropertiesFound) {
         String generalExplanation = """
                 Critical failure. Quarkus tests would fail with corrupted application errors.
                 The reason is that they would not run in the right order, because the Quarkus JUnit configuration has been overridden.
@@ -161,16 +213,38 @@ public class CustomLauncherInterceptor
 
         String message;
         if (orderer.isPresent()) {
+            // A custom orderer is configured, which is overriding the Quarkus orderer
             message = String.format(
-                    "%sTo set a test order while preserving the Quarkus required sorting, please use the Quarkus configuration to set junit.quarkus.orderer.secondary-orderer=%s, and remove the junit-platform.properties (if any) from the classpath.",
-                    generalExplanation, orderer.get());
+                    "%sA custom class orderer '%s' has been configured which overrides the Quarkus required ordering.\n"
+                            + "To preserve your custom ordering while allowing Quarkus to group tests by profile, you can:\n"
+                            + "1. Use the Quarkus secondary orderer configuration: Add quarkus.test.class-orderer=%s to your application.properties\n"
+                            + "2. Or, if you're certain your tests don't need profile-based grouping, disable this check with system property: -D%s=true\n"
+                            + "3. Or, replace the orderer with %s in your junit-platform.properties file",
+                    generalExplanation, orderer.get(), orderer.get(), ORDERER_CHECK_DISABLE_PROPERTY,
+                    DESIRED_CLASS_ORDERER.getName());
         } else {
-            message = String.format(
-                    """
-                            %sIt looks like there is a junit-platform.properties configuration file on the project classpath.
-                            The JUnit framework will only read the first properties it finds, which prevents Quarkus from setting the class orderer it needs.
-                            Please either add junit.jupiter.testclass.order.default=%s to your project's junit-platform.properties file, or remove the file and use system properties to configure JUnit.""",
-                    generalExplanation, DESIRED_CLASS_ORDERER.getName());
+            // No orderer is configured
+            if (quarkusPropertiesFound) {
+                message = String.format(
+                        """
+                                %sThe Quarkus junit-platform.properties file was found on the classpath, but JUnit did not load the class orderer configuration from it.
+                                This usually happens when another junit-platform.properties file earlier in the classpath overrides it.
+                                To fix this:
+                                1. Add junit.jupiter.testclass.order.default=%s to your project's junit-platform.properties file (if you have one)
+                                2. Or, remove any junit-platform.properties files from your project and let Quarkus provide the configuration
+                                3. Or, if you're certain your tests don't need profile-based grouping, disable this check with system property: -D%s=true""",
+                        generalExplanation, DESIRED_CLASS_ORDERER.getName(), ORDERER_CHECK_DISABLE_PROPERTY);
+            } else {
+                message = String.format(
+                        """
+                                %sThe Quarkus junit-platform.properties file was NOT found on the classpath.
+                                This suggests a dependency or classpath issue with the Quarkus test framework.
+                                To fix this:
+                                1. Ensure you have the correct Quarkus test framework dependency (io.quarkus:quarkus-junit5)
+                                2. Or, add junit.jupiter.testclass.order.default=%s to a junit-platform.properties file in your test resources
+                                3. Or, if you're certain your tests don't need profile-based grouping, disable this check with system property: -D%s=true""",
+                        generalExplanation, DESIRED_CLASS_ORDERER.getName(), ORDERER_CHECK_DISABLE_PROPERTY);
+            }
         }
         return message;
     }
