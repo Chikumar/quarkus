@@ -549,6 +549,18 @@
                 </exclusions>
             </dependency>
 
+            <!-- Hibernate ORM skinny BOM - available in Hibernate ORM 8.0.0.Beta4+ -->
+            <!-- Uncomment when upgrading to Hibernate ORM 8.0.0.Beta4 or later -->
+            <!--
+            <dependency>
+                <groupId>org.hibernate.orm</groupId>
+                <artifactId>hibernate-bom</artifactId>
+                <version>${hibernate-orm.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            -->
+
             <!-- Mutiny and Vert.x Mutiny Binding BOMs -->
             <dependency>
                 <groupId>io.smallrye.reactive</groupId>
